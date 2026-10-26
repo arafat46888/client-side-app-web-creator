@@ -278,7 +278,7 @@ function renderProviders() {
         <span class="muted ping-slot" style="min-width:110px;text-align:right"></span>
       </div>
     </div>`).join("");
-  renderUsageTable(); renderGenProviderSelect(); renderAnalytics();
+  renderUsageTable(); populateProviderSelects(); renderAnalytics();
 }
 
 function renderUsageTable() {
@@ -322,11 +322,35 @@ function invalidateTest() {           // any change re-locks Save
   if (sig !== testPassedFor) $("#saveProvBtn").disabled = true;
 }
 
+/* friendly hints for the most common browser-side connection failures */
+function explainTestFailure(detail, f) {
+  const d = String(detail || "").toLowerCase();
+  if (d.includes("failed to fetch") || d.includes("networkerror") || d.includes("load failed") || d.includes("network/cors")) {
+    let hint = "The browser could not reach this endpoint at all (network blocked or CORS refused).";
+    if (/^http:\/\//i.test(f.baseUrl) && location.protocol === "https:")
+      hint += " \u26a0\ufe0f Mixed content: an https page cannot call an http:// endpoint \u2014 open this app over http://localhost instead.";
+    if (/localhost|127\.0\.0\.1/.test(f.baseUrl))
+      hint += " For Ollama set OLLAMA_ORIGINS=* ; for LM Studio enable CORS in the server settings.";
+    if ((f.spec || "openai") === "anthropic")
+      hint += " Anthropic needs the anthropic-dangerous-direct-browser-access header (this app already sends it).";
+    if ((f.spec || "openai") === "gemini")
+      hint += " Gemini keys go in the ?key= query param (this app does that automatically).";
+    return `${hint} Raw error: ${detail}`;
+  }
+  if (d.includes("timed out")) return `${detail} \u2014 try again, or use a faster/nearer endpoint.`;
+  if (/\b401\b|\b403\b/.test(d)) return `${detail} \u2014 the API Key was rejected. Double-check the key and that it matches this base URL.`;
+  if (/\b404\b/.test(d)) return `${detail} \u2014 endpoint or model not found. The OpenAI-style base URL usually ends with /v1, and the Model id must match the provider's list exactly.`;
+  if (/\b429\b/.test(d)) return `${detail} \u2014 rate-limited by the provider. Wait a moment and test again.`;
+  return detail;
+}
+
 async function testConnection() {
   const f = readForm();
-  if (!f.name || !f.baseUrl || !f.model) { $("#testResult").innerHTML = "⚠️ Fill Name, Base URL and Model first."; return; }
-  const btn = $("#testConnBtn"); btn.disabled = true;
-  $("#testResult").innerHTML = `<span class="spin">🔄</span> Contacting ${esc(f.baseUrl)} …`;
+  if (!f.name || !f.baseUrl || !f.model) { $("#testResult").innerHTML = "\u26a0\ufe0f Fill Name, Base URL and Model first."; return; }
+  if (!/^https?:\/\//i.test(f.baseUrl)) { $("#testResult").innerHTML = "\u26a0\ufe0f Base URL must start with http:// or https:// (e.g. https://api.openai.com/v1)."; return; }
+  const btn = $("#testConnBtn"), saveBtn = $("#saveProvBtn");
+  btn.disabled = true; saveBtn.disabled = true; testPassedFor = "";
+  $("#testResult").innerHTML = `<span class="spin">\U0001f504</span> Contacting ${esc(f.baseUrl)} \u2026`;
   let ok = false, detail = "";
   try {
     const probeMsgs = [{ role:"user", content:"What is 1+1? Reply with only the number." }];
@@ -341,20 +365,24 @@ async function testConnection() {
       const j = await resp.json().catch(() => ({}));
       const txt = String(req.extract(j) || "(empty reply)").trim();
       const u = req.usage(j);
-      ok = true; detail = `HTTP 200 OK · ${(u.in+u.out)} tok · model said “${txt.slice(0,40)}”`;
+      /* HTTP 200 but no assistant text usually means the Spec doesn't match this endpoint */
+      const empty = txt === "(empty reply)";
+      ok = true;
+      detail = `HTTP 200 OK \u00b7 ${(u.in+u.out)} tok \u00b7 model said \u201c${txt.slice(0,40)}\u201d` +
+               (empty ? " (\u26a0\ufe0f empty reply \u2014 check the Spec matches this endpoint)" : "");
     } else {
-      const body = await resp.text().catch(()=>"");
-      detail = `HTTP ${resp.status} ${resp.statusText} — ${body.slice(0,140)}`;
+      const body = await resp.text().catch(()=>"" );
+      detail = `HTTP ${resp.status} ${resp.statusText} \u2014 ${body.slice(0,140)}`;
     }
   } catch (e) { detail = e.message || String(e); }
   btn.disabled = false;
   if (ok) {
     testPassedFor = providerSignature(readForm());
-    $("#saveProvBtn").disabled = false;
-    $("#testResult").innerHTML = `✅ <b>${esc(detail)}</b> — Save unlocked.`;
+    saveBtn.disabled = false;
+    $("#testResult").innerHTML = `\u2705 <b>${esc(detail)}</b> \u2014 Save unlocked.`;
   } else {
-    testPassedFor = ""; $("#saveProvBtn").disabled = true;
-    $("#testResult").innerHTML = `❌ Connection failed: ${esc(detail)}`;
+    testPassedFor = ""; saveBtn.disabled = true;
+    $("#testResult").innerHTML = `\u274c Connection failed: ${esc(explainTestFailure(detail, f))}`;
   }
 }
 
@@ -364,11 +392,11 @@ function saveProvider(e) {
   const f = readForm(); const ps = getProviders();
   if (editingProviderId) {
     const p = ps.find(x => x.id === editingProviderId);
-    Object.assign(p, f, { status:"active" });
+    Object.assign(p, f, { status:"active", lastHealthCheckMs: p.lastHealthCheckMs || 0 });
   } else {
     ps.push({ id:uid(), ...f, totalRequests:0, totalTokensUsed:0, lastHealthCheckMs:0, status:"active" });
   }
-  setProviders(ps); renderProviders(); resetForm();
+  setProviders(ps); renderProviders(); populateProviderSelects(); resetForm();
   toast(`Provider “${f.name}” saved 🟢`, "ok");
 }
 
@@ -943,9 +971,14 @@ async function executePlanStep(planObj, o) {
 function chosenProvider(role) {
   const r = getRouting();
   const ps = getProviders();
-  const selId = $(role === "planner" ? "#plannerProvider" : "#genProvider")?.value;
-  return (selId && ps.some(p => p.id === selId) ? selId
-    : (r[role] && ps.some(p => p.id === r[role]) ? r[role] : ps[0]?.id)) || "";
+  const valid = id => id && ps.some(p => p.id === id);
+  /* priority: explicit per-context select (chat bar) > dashboard select > saved routing > first provider */
+  const chatSel = $(role === "planner" ? "#chatPlannerProvider" : "#chatCoderProvider")?.value;
+  const dashSel = $(role === "planner" ? "#plannerProvider"     : "#genProvider")?.value;
+  return valid(chatSel) ? chatSel
+       : valid(dashSel) ? dashSel
+       : valid(r[role]) ? r[role]
+       : (ps[0]?.id || "");
 }
 
 /* ============================================================== CHAT ==== */
@@ -1197,6 +1230,13 @@ const APP_TEMPLATES = [
     p:"A Pomodoro focus timer: 25/5 minute cycles, circular progress ring (SVG), start/pause/reset, session counter, glassmorphism styling." },
 ];
 
+function renderTemplates() {
+  const grid = $("#templateGrid"); if (!grid) return;
+  grid.innerHTML = APP_TEMPLATES.map((t, i) => `
+    <button type="button" class="chip tpl" data-tpl="${i}" title="${esc(t.p)}">
+      ${t.e} ${esc(t.n)}<span class="muted" style="font-size:10.5px;display:block">${esc(t.d)}</span></button>`).join("");
+}
+
 /* =============================================== DASHBOARD / SUGGESTS == */
 const SUGGESTIONS_BY_DAYPART = {
   morning: [
@@ -1277,6 +1317,8 @@ async function renderProjectsLists() {
       <button class="btn sm" data-open="${p.id}">Open ▸</button>
       <button class="btn sm danger" data-del="${p.id}">🗑</button>
     </div>`).join("") || `<p class="muted">No projects yet — generate one above or press ＋ New.</p>`;
+  const tag = $("#activeProjTag");
+  if (tag) tag.textContent = currentProject ? `📂 active: ${currentProject.title}` : "";
   const opts = projs.map(p => `<option value="${p.id}">${esc(p.title)}</option>`).join("") || `<option value="">— no projects —</option>`;
   for (const sel of [$("#studioProjectSel"), $("#chatProjectSel")]) {
     if (!sel) continue;
@@ -1287,13 +1329,29 @@ async function renderProjectsLists() {
   }
 }
 
-function renderGenProviderSelect() {
-  const sel = $("#genProvider"), cur = sel.value;
-  sel.innerHTML = getProviders().map(p =>
-    `<option value="${p.id}">${esc(p.name)} · ${esc(p.model)} ${p.status==="active"?"🟢":p.status==="error"?"🔴":"⚪"}</option>`).join("")
-    || `<option value="">No provider configured</option>`;
-  if ([...sel.options].some(o=>o.value===cur)) sel.value = cur;
+/* fills EVERY provider dropdown (dashboard coder/planner, chat coder/planner, settings routing) */
+function providerOptionHtml(p) {
+  return `<option value="${p.id}">${esc(p.name)} · ${esc(p.model)} ${p.status==="active"?"🟢":p.status==="error"?"🔴":"⚪"}</option>`;
 }
+function fillProviderSelect(selId, keepId) {
+  const sel = $(selId); if (!sel) return;
+  const cur = keepId ?? sel.value;
+  const ps = getProviders();
+  sel.innerHTML = ps.map(providerOptionHtml).join("")
+    || `<option value="">No provider configured</option>`;
+  if (cur && ps.some(p => p.id === cur)) sel.value = cur;
+  else if (ps.length && keepId && ps.some(p => p.id === keepId)) sel.value = keepId;
+}
+function populateProviderSelects() {
+  const r = getRouting();
+  fillProviderSelect("#genProvider");
+  fillProviderSelect("#plannerProvider");
+  fillProviderSelect("#chatCoderProvider");
+  fillProviderSelect("#chatPlannerProvider");
+  fillProviderSelect("#routePlanner",  r.planner);
+  fillProviderSelect("#routeCoder",    r.coder);
+}
+const renderGenProviderSelect = populateProviderSelects;   /* legacy alias */
 
 /* ================================================================ THEMES */
 const THEMES = ["glass-dark","cyberpunk","neumorphism","clean-minimal"];
@@ -1312,6 +1370,22 @@ function aiTheme() {  /* deterministic "AI-driven" vibe picker seeded by prompt 
 }
 
 /* ================================================================ ROUTING */
+function setBuilderMode(mode) {
+  const build = mode === "build";
+  $("#buildMode").style.display  = build ? "" : "none";
+  $("#chatMode").style.display   = build ? "none" : "";
+  $("#modeBuildBtn").classList.toggle("active", build);
+  $("#modeChatBtn").classList.toggle("active", !build);
+  if (!build && currentProject) $("#chatProjectSel").value = currentProject.id;
+}
+
+/* right-side panel of the studio: chat thread or checkpoint timeline */
+function showPanel(which) {
+  const chat = which === "chat";
+  $("#chatPanel").style.display    = chat ? "" : "none";
+  $("#historyPanel").style.display = chat ? "none" : "";
+}
+
 function switchPage(name) {
   $$(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + name));
   $$(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.page === name));
@@ -1320,6 +1394,13 @@ function switchPage(name) {
 }
 
 /* ==================================================================== INIT */
+window.addEventListener("error", e => { try {
+  const w = document.getElementById("toastWrap"); if (!w) return;
+  const d = document.createElement("div"); d.className = "toast err";
+  d.textContent = "⚠️ JS error: " + (e.message || "unknown"); w.appendChild(d);
+  setTimeout(() => d.remove(), 8000);
+} catch {} });
+
 document.addEventListener("DOMContentLoaded", async () => {
   /* ---- theme ---- */
   applyTheme(localStorage.getItem(LS_THEME) || "glass-dark");
@@ -1348,6 +1429,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#nextSuggestionBtn").onclick = () => { twIdx++; startTypewriter(); };
 
   /* ---- build mode / generation ---- */
+  $("#templateGrid").addEventListener("click", e => {
+    const b = e.target.closest("[data-tpl]"); if (!b) return;
+    const t = APP_TEMPLATES[+b.dataset.tpl];
+    setBuilderMode("build");
+    const ta = $("#promptInput"); ta.value = t.p; ta.focus();
+    toast(`Template “${t.n}” loaded into the prompt ✨`, "ok", 2200);
+  });
   $("#modeBuildBtn").onclick = () => setBuilderMode("build");
   $("#modeChatBtn").onclick   = () => setBuilderMode("chat");
   $("#generateBtn").onclick = startBuildFromDashboard;
@@ -1514,7 +1602,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       fp.lastHealthCheckMs = res.ms; fp.status = res.ok ? "active" : "error";
       setProviders(fresh);
       slot.innerHTML = res.ok ? `<b style="color:var(--ok)">${res.ms}ms – Active 🟢</b>` : `<b style="color:var(--err)">${res.ms}ms – Down 🔴</b>`;
-      if (!res.ok) toast(`${p.name}: ${res.err}`, "err");
+      if (!res.ok) { slot.title = res.err || ""; toast(`${p.name}: ${res.err}`, "err", 6000); }
       renderUsageTable(); renderAnalytics();
       setTimeout(renderProviders, 1400);
     }
