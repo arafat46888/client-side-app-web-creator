@@ -1,0 +1,121 @@
+📄 Product Requirement Document (PRD)
+1. Project Overview
+Project Name: Client-Side App Builder
+
+Architecture: 100% Client-Side Single Page Application (SPA) / Static Export
+
+Primary Target: zero-backend, privacy-first, browser-executed multi-model AI app/website development tool.
+
+Storage Engine: Browser localStorage (Configurations/API Keys) + IndexedDB (Project Code Files, Tree Structure, & Logs).
+
+2. Core Feature Modules
+Module A: Provider & API Management (Settings Page)
+Provider Configuration Form:
+
+Fields: Provider Name, Base URL, API Key, Model Identifier, Max Tokens, Temperature.
+
+Supported Specs: OpenAI REST Standard (Works for OpenAI, Groq, OpenRouter, Together AI, Ollama, LM Studio, etc.) and Anthropic/Gemini SDK compatibility.
+
+Interactive API Testing & Health Checks:
+
+Initial Setup: Clicking "Test Connection" sends a payload (e.g., 1+1=? or standard /v1/models check).
+
+Conditional Save Button: The "Save Provider" button becomes active only after receiving an HTTP 200 OK response.
+
+Active Health Check: Every saved provider card retains a "Ping/Check Status" button showing live latency in milliseconds (e.g., 180ms - Active 🟢).
+
+API Analytics & Usage Tracking:
+
+Track request counts per provider key.
+
+Log input/output token usage per file generation.
+
+Module B: AI-Powered Interactive Dashboard
+Dynamic Theme Engine:
+
+AI-driven theme toggling (Glassmorphism Dark, Cyberpunk, Neumorphism, Clean Minimal).
+
+Daily Smart Prompts & Suggestions:
+
+Time-aware auto-suggested app ideas (e.g., "Build a SaaS Landing Page", "Create a Portfolio with Tailwind").
+
+Interactive Auto-Typing Prompt Assistant:
+
+Animated auto-typing text in the prompt box suggesting new project ideas.
+
+One-click action to insert suggestions into the active prompt context.
+
+Module C: Client-Side File Manager & Code Studio
+VS Code-style File Explorer:
+
+Full File & Directory Tree (Create File, Create Folder, Rename, Delete).
+
+Supports file formats: .html, .css, .js, .ts, .php, .json, .md.
+
+Code Editor & Live Sandbox:
+
+Integrated Monaco Editor or CodeMirror 6 with syntax highlighting.
+
+Real-time rendering inside an isolated <iframe> sandbox (srcdoc execution).
+
+One-Click Export:
+
+Client-side ZIP compilation using JSZip to download entire project directory trees.
+
+3. Data Schema (IndexedDB / LocalStorage)
+TypeScript
+interface ProviderConfig {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  totalRequests: number;
+  totalTokensUsed: number;
+  lastHealthCheckMs: number;
+  status: 'active' | 'error' | 'untested';
+}
+
+interface ProjectFile {
+  id: string;
+  path: string; // e.g. "/src/styles.css"
+  name: string;
+  content: string;
+  type: 'file' | 'folder';
+  parentId?: string;
+}
+
+interface AppProject {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  files: ProjectFile[];
+}
+🤖 System Prompt for AI Engine (Master Prompt)
+যদি তুমি এই অ্যাপ বা ওয়েবসাইট বিল্ডারের কোড জেনারেশন অংশটি কোনো AI Model (যেমন ChatGPT, Claude, Gemini, Groq) দিয়ে চালাতে চাও, তাহলে নিচে দেওয়া Master System Prompt টি তোমার অ্যাপের ব্যাকএন্ড/ক্লায়েন্ট-সাইড AI কলেরিয়া সেট করে দেবে:
+
+Plaintext
+You are "Client-Side App Builder AI", an elite full-stack web engineering assistant. Your role is to generate complete, clean, modular, and production-ready web application code based on user requests.
+
+### CRITICAL RULES:
+1. OUTPUT FORMAT: Always format code outputs strictly as valid JSON array of files so the client-side app manager can write them directly into the file system.
+2. FILE STRUCTURE: Separate concerns cleanly. Never put everything in one file unless explicitly requested. Always separate HTML, CSS, JavaScript/TypeScript, and modular assets where applicable.
+3. DEPENDENCIES: Use browser-executable CDN scripts (like Tailwind CSS CDN, FontAwesome, Lucide Icons) inside `index.html` for instant client-side rendering.
+4. ZERO ASSUMPTIONS: Ensure all code generated is fully functional without missing functions, placeholder comments, or truncated logic ("// write remaining code here").
+
+### RESPONSE JSON FORMAT SCHEMA:
+[
+  {
+    "path": "index.html",
+    "content": "<!DOCTYPE html>..."
+  },
+  {
+    "path": "css/styles.css",
+    "content": "/* CSS styling */"
+  },
+  {
+    "path": "js/app.js",
+    "content": "// JavaScript code"
+  }
+]
