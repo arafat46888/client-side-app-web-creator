@@ -30,30 +30,47 @@ function promptModal(title, def = "", placeholder = "") {
   });
 }
 
-/* ------------------------------------------------- MASTER SYSTEM PROMPT */
-const MASTER_SYSTEM_PROMPT = `You are "Client-Side App Builder AI", an elite full-stack web engineering assistant. Your role is to generate complete, clean, modular, and production-ready web application code based on user requests.
+/* --------------------------------------------- TWO-PASS AI SYSTEM PROMPTS */
+const DEFAULT_SP_PLANNER = `You are the planning brain of a client-side app builder. Given a user request and the current project file list, output ONLY valid JSON:
+{
+  "intent": "build" | "edit",
+  "summary": "<one sentence>",
+  "filesToTouch": ["<existing or new path>", ...],
+  "plan": ["<imperative step>", ...]
+}
+Rules:
+- For "edit", filesToTouch MUST be a subset of existing files + at most 2 new files.
+- Never list more than 6 files. Prefer fewer.
+- No prose. No markdown fences. JSON only.`;
 
-### CRITICAL RULES:
-1. OUTPUT FORMAT: Always format code outputs strictly as valid JSON array of files so the client-side app manager can write them directly into the file system.
-2. FILE STRUCTURE: Separate concerns cleanly. Never put everything in one file unless explicitly requested. Always separate HTML, CSS, JavaScript/TypeScript, and modular assets where applicable.
-3. DEPENDENCIES: Use browser-executable CDN scripts (like Tailwind CSS CDN, FontAwesome, Lucide Icons) inside \`index.html\` for instant client-side rendering.
-4. ZERO ASSUMPTIONS: Ensure all code generated is fully functional without missing functions, placeholder comments, or truncated logic ("// write remaining code here").
+const DEFAULT_SP_CODER = `You are "Client-Side App Builder AI". You generate production-ready web app code.
 
-### RESPONSE JSON FORMAT SCHEMA:
-[
-  {
-    "path": "index.html",
-    "content": "<!DOCTYPE html>..."
-  },
-  {
-    "path": "css/styles.css",
-    "content": "/* CSS styling */"
-  },
-  {
-    "path": "js/app.js",
-    "content": "// JavaScript code"
-  }
-]`;
+### INPUT
+You receive: user request, an approved plan, the full content of files listed in the plan, and a CDN whitelist.
+
+### RUNTIME
+Browser-only sandbox. No build step. No Node. No require(). Use <script type="module"> + ESM CDN URLs (esm.sh, jsdelivr) for libs. Tailwind via CDN (https://cdn.tailwindcss.com). Prefer vanilla JS + Tailwind for small apps; React via esm.sh only if requested.
+
+### OUTPUT
+Return ONLY valid JSON, no fences, matching:
+{
+  "changes": [
+    { "op": "create"|"update"|"delete", "path": "<relative, no leading />", "content": "<full file content>" }
+  ]
+}
+Rules:
+- Only touch files in the approved plan. Unmentioned files are preserved by the host.
+- "delete" has no content field.
+- Every "create"/"update" contains the COMPLETE file. Never write "// rest unchanged".
+- All relative <script src>/<link href> must point to files you are creating or updating in THIS response, or to absolute https CDN URLs.
+- No placeholder comments. No TODOs. No truncation.
+- If the request is ambiguous or unsafe, return:
+  { "changes": [], "error": "<reason>" }`;
+
+const getSpPlanner = () => localStorage.getItem("csab.sp.planner") || DEFAULT_SP_PLANNER;
+const getSpCoder   = () => localStorage.getItem("csab.sp.coder")   || DEFAULT_SP_CODER;
+const getRouting   = () => { try { return JSON.parse(localStorage.getItem("csab.routing")) || {}; } catch { return {}; } };
+const setRouting   = r => localStorage.setItem("csab.routing", JSON.stringify(r));
 
 /* ------------------------------------------------------ localStorage cfg */
 const LS_PROVIDERS = "csab.providers", LS_THEME = "csab.theme", LS_PROJECT = "csab.activeProject";
@@ -61,7 +78,7 @@ const getProviders = () => { try { return JSON.parse(localStorage.getItem(LS_PRO
 const setProviders = p => localStorage.setItem(LS_PROVIDERS, JSON.stringify(p));
 
 /* ------------------------------------------------------------- IndexedDB */
-const DB_NAME = "csappbuilder", DB_VER = 1;
+const DB_NAME = "csappbuilder", DB_VER = 2;
 let _dbp = null;
 function openDB() {
   if (_dbp) return _dbp;
@@ -71,6 +88,8 @@ function openDB() {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("projects"))     db.createObjectStore("projects", { keyPath: "id" });
       if (!db.objectStoreNames.contains("generationLogs")) db.createObjectStore("generationLogs", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("chatMessages"))  db.createObjectStore("chatMessages",  { keyPath: "id" });
+      if (!db.objectStoreNames.contains("checkpoints"))   db.createObjectStore("checkpoints",   { keyPath: "id" });
     };
     rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
   });
@@ -91,7 +110,25 @@ const DB = {
   addLog:      l => idb("generationLogs", "readwrite", tx => tx.objectStore("generationLogs").put(l)),
   allLogs:     () => idb("generationLogs", "readonly", tx => tx.objectStore("generationLogs").getAll()),
   clearLogs:   () => idb("generationLogs", "readwrite", tx => tx.objectStore("generationLogs").clear()),
+  /* chat thread per project */
+  putMsg:      m => idb("chatMessages", "readwrite", tx => tx.objectStore("chatMessages").put(m)),
+  msgsOf:      pid => idb("chatMessages", "readonly", tx => tx.objectStore("chatMessages").getAll()),
+  delMsgsOf:   pid => idb("chatMessages", "readwrite", async tx => {
+                    const st = tx.objectStore("chatMessages");
+                    const all = await req0(st.getAll());
+                    all.filter(m => m.projectId === pid).forEach(m => st.delete(m.id));
+                  }),
+  /* checkpoints (full snapshots — bulletproof undo) */
+  putCkpt:     c => idb("checkpoints", "readwrite", tx => tx.objectStore("checkpoints").put(c)),
+  ckptsOf:     pid => idb("checkpoints", "readonly", tx => tx.objectStore("checkpoints").getAll()),
+  delCkptsOf:  pid => idb("checkpoints", "readwrite", async tx => {
+                    const st = tx.objectStore("checkpoints");
+                    const all = await req0(st.getAll());
+                    all.filter(c => c.projectId === pid).forEach(c => st.delete(c.id));
+                  }),
 };
+/* helper: turn an IDBRequest into a promise inside an async transaction callback */
+function req0(r){ return new Promise((res,rej)=>{ r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
 
 /* ============================================================== PROVIDERS */
 const PRESETS = [
@@ -108,8 +145,9 @@ let editingProviderId = null, testPassedFor = "";   // conditional-save gate
 
 function providerSignature(f) { return [f.name, f.baseUrl, f.apiKey, f.model, f.spec].join("|"); }
 
-function buildChatRequest(p, messages) {
+function buildChatRequest(p, messages, opts = {}) {
   const maxTok = p.maxTokens || 8192, temp = p.temperature ?? 0.4;
+  const wantStream = !!opts.stream;
   if (p.spec === "anthropic") {
     const sys = messages.find(m => m.role === "system")?.content;
     const rest = messages.filter(m => m.role !== "system");
@@ -117,7 +155,7 @@ function buildChatRequest(p, messages) {
       url: `${p.baseUrl.replace(/\/$/, "")}/messages`,
       headers: { "Content-Type":"application/json", "x-api-key":p.apiKey||"none",
                  "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" },
-      body: { model:p.model, max_tokens:maxTok, temperature:temp, ...(sys?{system:sys}:{}) , messages:rest },
+      body: { model:p.model, max_tokens:maxTok, temperature:temp, ...(sys?{system:sys}:{}) , messages:rest, ...(wantStream?{stream:true}:{}) },
       extract: j => (j.content||[]).map(c => c.text || "").join(""),
       usage: j => ({ in:(j.usage?.input_tokens)||0, out:(j.usage?.output_tokens)||0 }),
     };
@@ -131,6 +169,8 @@ function buildChatRequest(p, messages) {
       headers: { "Content-Type":"application/json" },
       body: { contents:rest, ...(sys?{systemInstruction:{parts:[{text:sys}]}}:{}),
               generationConfig:{ maxOutputTokens:maxTok, temperature:temp } },
+      streamUrl: `${p.baseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(p.model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(p.apiKey||"")}`,
+      sseExtract: j => (j.candidates?.[0]?.content?.parts||[]).map(x=>x.text).join(""),
       extract: j => (j.candidates?.[0]?.content?.parts||[]).map(x=>x.text).join(""),
       usage: j => ({ in:(j.usageMetadata?.promptTokenCount)||0, out:(j.usageMetadata?.candidatesTokenCount)||0 }),
     };
@@ -139,10 +179,50 @@ function buildChatRequest(p, messages) {
   return {
     url: `${p.baseUrl.replace(/\/$/, "")}/chat/completions`,
     headers: { "Content-Type":"application/json", ...(p.apiKey?{Authorization:`Bearer ${p.apiKey}`}:{}) },
-    body: { model:p.model, messages, max_tokens:maxTok, temperature:temp },
+    body: { model:p.model, messages, max_tokens:maxTok, temperature:temp, ...(wantStream?{stream:true}:{}) },
+    sseExtract: j => j.choices?.[0]?.delta?.content ?? "",
     extract: j => j.choices?.[0]?.message?.content ?? "",
     usage: j => ({ in:(j.usage?.prompt_tokens)||0, out:(j.usage?.completion_tokens)||0 }),
   };
+}
+
+/* Unified completion call. Streams SSE when provider supports it (onDelta gets chunks). */
+async function chatCompletion(p, messages, { signal, onDelta } = {}) {
+  const req = buildChatRequest(p, messages, { stream: !!onDelta });
+  let resp;
+  try {
+    resp = await fetch(req.url, { method:"POST", headers:req.headers, body:JSON.stringify(req.body), signal });
+    if (!resp.ok && onDelta && req.sseExtract) {          // retry without streaming (some proxies reject SSE)
+      resp = await fetch(req.url, { method:"POST", headers:req.headers,
+        body:JSON.stringify({ ...req.body, stream:false }), signal });
+    }
+  } catch (e) {
+    throw new Error(e.name === "AbortError" ? e : (e.message || "Network/CORS failure"));
+  }
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text().catch(()=>"")) .slice(0,220)}`);
+  const ctype = resp.headers.get("content-type") || "";
+  if (onDelta && req.sseExtract && ctype.includes("event-stream") && resp.body) {
+    const dec = new TextDecoder(); let buf = "", full = "";
+    for await (const chunk of resp.body) {
+      buf += dec.decode(chunk, { stream:true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const j = JSON.parse(data);
+          const piece = req.sseExtract(j);
+          if (piece) { full += piece; onDelta(piece, full); }
+        } catch {}
+      }
+    }
+    const usage = { in: Math.ceil(messages.reduce((a,m)=>a+m.content.length,0)/4), out: Math.ceil(full.length/4) };
+    return { text: full, usage, streamed: true };
+  }
+  const j = await resp.json();
+  return { text: String(req.extract(j) || ""), usage: req.usage(j), streamed: false };
 }
 
 async function pingProvider(p) {
@@ -305,7 +385,7 @@ function fileIcon(name) {
 const ALLOWED_EXT = ["html","css","js","ts","php","json","md"];
 
 async function newProject(title) {
-  const proj = { id:uid(), title, createdAt:Date.now(), updatedAt:Date.now(),
+  const proj = { id:uid(), title, createdAt:Date.now(), updatedAt:Date.now(), currentCheckpointId:null,
     files:[ { id:uid(), path:"/index.html", name:"index.html", type:"file", content:
 `<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8"><title>${esc(title)}</title>\n<link rel="stylesheet" href="/css/styles.css">\n</head>\n<body>\n<h1>Hello from ${esc(title)} 👋</h1>\n<script src="/js/app.js"><\/script>\n</body>\n</html>` },
       { id:uid(), path:"/css", name:"css", type:"folder", content:"" },
@@ -322,8 +402,9 @@ async function newProject(title) {
 async function loadProject(id) {
   const p = await DB.getProject(id); if (!p) return;
   currentProject = p; localStorage.setItem(LS_PROJECT, id);
+  pickedElement = null; updatePickBar(); hideErrorOverlay();
   openFileId = null; $("#editorFileName").textContent = "no file open";
-  renderTree(); renderProjectsLists(); refreshPreview();
+  renderTree(); renderProjectsLists(); refreshPreview(); renderTimeline(); renderChat();
   const idx = p.files.find(f => f.type==="file" && f.name.toLowerCase()==="index.html");
   if (idx) openFile(idx.path);
 }
@@ -515,12 +596,81 @@ function inlineAssets(html) {
   });
   return html;
 }
-function refreshPreview() {
+let _lastBundledHtml = "", _hotCount = 0, _pendingHot = null;
+function refreshPreview(force) {
   const frame = $("#previewFrame");
-  if (!currentProject) { frame.srcdoc = ""; return; }
+  if (!currentProject) { frame.srcdoc = ""; _lastBundledHtml = ""; return; }
   const idx = currentProject.files.find(f => f.type==="file" && f.name.toLowerCase()==="index.html");
   if (!idx) { frame.srcdoc = `<body style="font:14px system-ui;display:grid;place-items:center;height:100vh;color:#666">No index.html in this project.</body>`; return; }
-  frame.srcdoc = inlineAssets(idx.content || "");
+  let html = inlineAssets(idx.content || "");
+  /* runtime bridge: error capture + element inspector (injected before user code) */
+  html = html.replace(/<head[^>]*>/i, m => m + PREVIEW_BRIDGE);
+  if (!/<head[^>]*>/i.test(html)) html = PREVIEW_BRIDGE + html;   // headless models sometimes omit <head>
+  if (!force && html === _lastBundledHtml) return;               // hot reload: skip identical rebuilds
+  _lastBundledHtml = html; _hotCount++;
+  $("#hotReloadTag").textContent = `hot-reload #${_hotCount} · srcdoc`;
+  hideErrorOverlay();
+  frame.srcdoc = html;
+}
+const PREVIEW_BRIDGE = `
+<script>
+(function(){
+  function cssPath(el){var p=[];while(el&&el.nodeType===1&&p.length<6){var s=el.tagName.toLowerCase();
+    if(el.id){p.unshift(s+"#"+el.id);break}
+    if(el.className&&typeof el.className==="string"){var c=el.className.trim().split(/\s+/)[0];if(c)s+="."+c}
+    p.unshift(s);el=el.parentElement}return p.join(">")}
+  window.addEventListener("error",function(e){try{parent.postMessage({type:"preview-error",
+    message:e.message||String(e.error),file:e.filename,line:e.lineno},"*")}catch(_){}});
+  window.addEventListener("unhandledrejection",function(e){try{parent.postMessage({type:"preview-error",
+    message:"Unhandled promise rejection: "+(e.reason&&(e.reason.message||e.reason))},"*")}catch(_){}});
+  var PICK=false,OLD=null;
+  window.addEventListener("message",function(ev){
+    var d=ev.data||{};
+    if(d.type==="set-pick-mode"){PICK=d.on;document.querySelectorAll("[data-ab-hl]").forEach(function(n){n.removeAttribute("data-ab-hl");n.style.outline=""});}
+  });
+  document.addEventListener("mouseover",function(e){if(!PICK)return;var t=e.target;
+    if(OLD&&OLD!==t){OLD.style.outline=""}t.style.outline="2px dashed #ff2d78";t.setAttribute("data-ab-hl","1");OLD=t;},true);
+  document.addEventListener("click",function(e){if(!PICK)return;e.preventDefault();e.stopPropagation();
+    var t=e.target;t.style.outline="2px solid #6d8dff";
+    parent.postMessage({type:"element-pick",selector:cssPath(t),tag:t.tagName.toLowerCase(),
+      outerHTML:(t.outerHTML||"").slice(0,500)},"*");
+    PICK=false;document.querySelectorAll("[data-ab-hl]").forEach(function(n){n.removeAttribute("data-ab-hl");n.style.outline=""});
+    parent.postMessage({type:"pick-off"},"*");},true);
+})();
+<\/script>`;
+
+/* ---- error overlay ---- */
+function showErrorOverlay(err){
+  $("#errOverlayMsg").textContent = `${err.message}${err.line ? " (line "+err.line+")" : ""}`;
+  $("#errOverlay").classList.add("show");
+  lastPreviewError = err;
+}
+function hideErrorOverlay(){ $("#errOverlay").classList.remove("show"); }
+let lastPreviewError = null;
+
+/* ---- viewport switcher ---- */
+function setViewport(vp){
+  const f = $("#previewFrame");
+  $$(".vp-btn").forEach(b => b.classList.toggle("active", b.dataset.vp === vp));
+  f.style.maxWidth = vp === "mobile" ? "390px" : vp === "tablet" ? "768px" : "100%";
+  localStorage.setItem("csab.viewport", vp);
+}
+
+/* ---- element inspector state ---- */
+let pickedElement = null, pickMode = false;
+function togglePickMode(on){
+  pickMode = on ?? !pickMode;
+  $("#previewPane").classList.toggle("pick-mode", pickMode);
+  $("#pickModeBtn").classList.toggle("primary", pickMode);
+  try { $("#previewFrame").contentWindow.postMessage({ type:"set-pick-mode", on:pickMode }, "*"); } catch {}
+}
+function updatePickBar(){
+  const bar = $("#pickBar"), badge = $("#elPickBadge");
+  if (pickedElement){
+    $("#pickedElInfo").textContent = `<${pickedElement.tag}> ${pickedElement.selector}`;
+    bar.classList.add("show");
+    badge.style.display = ""; badge.textContent = `🎯 target: <${pickedElement.tag}>`;
+  } else { bar.classList.remove("show"); badge.style.display = "none"; }
 }
 
 /* ---------- ZIP export (JSZip) ---------- */
@@ -537,84 +687,515 @@ async function exportZip() {
   toast("ZIP exported 📦", "ok");
 }
 
-/* ====================================================== AI GENERATION ==== */
-let genAbort = null;
+/* ====================================================== AI PIPELINE ====
+   Two-pass Lovable-style loop: Plan -> approve -> Code (streamed) -> validate -> apply -> checkpoint.
+   ==========================================================================*/
+let genAbort = null, pendingPlan = null;   // {mode, userPrompt, plan, coderId, plannerId, elementCtx}
 
-function extractJsonFiles(text) {
+/* --- tolerant JSON extraction (fence-stripper + bracket scanner) --- */
+function extractJsonObject(text) {
   if (!text) return null;
   let t = text.trim();
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence && fence[1].trim().startsWith("[")) t = fence[1].trim();
-  const s = t.indexOf("["), e = t.lastIndexOf("]");
+  if (fence) t = fence[1].trim();
+  const s = t.indexOf("{"), e = t.lastIndexOf("}");
   if (s === -1 || e <= s) return null;
-  try {
-    const arr = JSON.parse(t.slice(s, e+1));
-    if (!Array.isArray(arr)) return null;
-    return arr.filter(o => o && typeof o.path === "string" && typeof o.content === "string");
-  } catch { return null; }
+  try { return JSON.parse(t.slice(s, e+1)); } catch { return null; }
+}
+function extractChanges(text) {
+  /* accepts {changes:[...]} or legacy bare array [{path,content}] */
+  if (!text) return null;
+  let t = text.trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const obj = extractJsonObject(t);
+  if (obj && Array.isArray(obj.changes)) return obj.error ? { error: obj.error, changes: [] } : { changes: obj.changes };
+  const s = t.indexOf("["), e = t.lastIndexOf("]");
+  if (s !== -1 && e > s) {
+    try {
+      const arr = JSON.parse(t.slice(s, e+1));
+      if (Array.isArray(arr)) {
+        return { changes: arr.filter(o => o && typeof o.path === "string")
+          .map(o => ({ op: o.op || "create", path: o.path, content: o.content ?? "" })) };
+      }
+    } catch {}
+  }
+  return null;
 }
 
-async function generateProject() {
-  const promptText = $("#promptInput").value.trim();
-  const pid = $("#genProvider").value;
-  if (!promptText) return toast("Describe what you want to build first ✍️", "err");
-  const p = getProviders().find(x => x.id === pid);
-  if (!p) return toast("Configure a provider in ⚙️ Providers first (and Test Connection).", "err");
+/* --- Pass 3: deterministic validator (no LLM) --- */
+function validateChanges(changes, files) {
+  const errs = [];
+  const existing = new Set(files.filter(f => f.type === "file").map(f => f.path.replace(/^\//, "")));
+  const planned = new Set();
+  for (const c of changes) {
+    if (!["create","update","delete"].includes(c.op)) { errs.push(`bad op "${c.op}" on ${c.path}`); continue; }
+    const p = String(c.path || "").replace(/^\//, "");
+    if (!p || p.includes("..")) { errs.push(`unsafe path: ${c.path}`); continue; }
+    if (c.op === "update" || c.op === "delete") {
+      if (!existing.has(p) && !planned.has(p)) errs.push(`${c.op} targets non-existent file: ${p}`);
+    }
+    if (c.op === "create" && existing.has(p)) errs.push(`create collides with existing file: ${p} (use update)`);
+    if (c.op !== "delete" && typeof c.content !== "string") errs.push(`${p}: missing complete content`);
+    planned.add(p);
+  }
+  /* reference check on HTML changes: relative src/href must resolve to a real/planned file or absolute URL */
+  const finalSet = new Set(existing);
+  changes.forEach(c => { const p = String(c.path).replace(/^\//,"");
+    if (c.op === "delete") finalSet.delete(p); else finalSet.add(p); });
+  const html = changes.filter(c => /\.html?$/i.test(c.path)).map(c => c.content || "").join("\n");
+  const refRe = /<(?:script[^>]+src|link[^>]+href)=["']([^"']+)["']/gi; let m;
+  while ((m = refRe.exec(html))) {
+    const r = m[1];
+    if (/^(https?:|data:|#|mailto:)/i.test(r)) continue;
+    const rel = r.replace(/^\//, "").split("?")[0];
+    const base = rel.split("/").pop();
+    if (!finalSet.has(rel) && ![...finalSet].some(p => p.endsWith("/" + base)))
+      errs.push(`broken reference in HTML: "${r}" (no such file & not created in this response)`);
+  }
+  /* DOMParser sanity for every html change */
+  for (const c of changes.filter(c => /\.html?$/i.test(c.path) && c.content)) {
+    try {
+      const doc = new DOMParser().parseFromString(c.content, "text/html");
+      if (doc.querySelector("parsererror")) errs.push(`${c.path}: HTML does not parse cleanly`);
+    } catch { errs.push(`${c.path}: HTML parse threw`); }
+  }
+  return errs;
+}
 
-  const btn = $("#generateBtn"), stop = $("#stopGenBtn"), st = $("#genStatus"), pr = $("#genProgress");
-  btn.disabled = true; stop.style.display = ""; pr.style.display = "block";
-  st.textContent = "Thinking… (calling " + p.name + " / " + p.model + ")";
+/* --- apply diff ops to project.files (non-destructive merge) --- */
+async function applyChanges(proj, changes, label, sourceMsgId) {
+  const before = await createCheckpoint(proj, label + " · before", sourceMsgId);
+  for (const c of changes) {
+    const path = normalizePath(c.path);
+    const name = path.split("/").pop();
+    if (c.op === "delete") {
+      proj.files = proj.files.filter(f => !(f.path === path || f.path.startsWith(path + "/")));
+      continue;
+    }
+    const parts = path.split("/").filter(Boolean);
+    for (let i = 1; i < parts.length; i++) {
+      const fp = "/" + parts.slice(0, i).join("/");
+      if (!proj.files.some(f => f.path === fp))
+        proj.files.push({ id:uid(), path:fp, name:parts[i-1], content:"", type:"folder" });
+    }
+    const ex = proj.files.find(f => f.path === path && f.type === "file");
+    if (ex) ex.content = c.content ?? "";
+    else proj.files.push({ id:uid(), path, name, content:c.content ?? "", type:"file" });
+  }
+  proj.updatedAt = Date.now();
+  await DB.putProject({ ...proj });
+  const ck = await createCheckpoint(proj, label, sourceMsgId);
+  proj.currentCheckpointId = ck.id;
+  await DB.putProject({ ...proj });
+  currentProject = proj;
+  renderTree(); refreshPreview(); renderTimeline(); renderProjectsLists();
+  const idx = proj.files.find(f => f.type==="file" && f.name.toLowerCase()==="index.html");
+  if (idx && (!openFileId || !proj.files.some(f=>f.id===openFileId))) openFile(idx.path);
+  else if (idx && openFileId) {
+    const cur = proj.files.find(f=>f.id===openFileId);
+    if (cur && editor && cur.content !== editor.getValue()) openFile(cur.path);
+  }
+  return { before, after: ck };
+}
+
+async function createCheckpoint(proj, label, messageId) {
+  const ck = { id: uid(), projectId: proj.id, messageId: messageId || null,
+    files: JSON.parse(JSON.stringify(proj.files)), createdAt: Date.now(), label };
+  await DB.putCkpt(ck);
+  return ck;
+}
+
+/* --- Pass 1: planner --- */
+function fileListBrief(files) {
+  return files.filter(f => f.type === "file")
+    .map(f => `${f.path} :: ${(f.content||"").slice(0,200).replace(/\s+/g," ")}`).join("\n") || "(empty project)";
+}
+async function runPlanner(provider, userPrompt, files, signal) {
+  const msgs = [
+    { role:"system", content: getSpPlanner() },
+    { role:"user", content: `USER REQUEST:\n${userPrompt}\n\nCURRENT PROJECT FILES (path :: first 200 chars):\n${fileListBrief(files)}\n\nReturn ONLY the JSON plan object.` },
+  ];
+  const { text, usage } = await chatCompletion(provider, msgs, { signal });
+  const j = extractJsonObject(text);
+  if (!j || !Array.isArray(j.plan) || !Array.isArray(j.filesToTouch))
+    throw new Error("Planner returned invalid JSON. Snippet: " + (text||"(empty)").slice(0,140));
+  j.intent = j.intent === "build" ? "build" : "edit";
+  return { plan: j, usage };
+}
+
+/* --- Pass 2: coder (streamed) --- */
+function buildCoderMessages(userPrompt, planObj, files, elementCtx) {
+  const touch = new Set((planObj.filesToTouch||[]).map(p => p.replace(/^\//,"")));
+  const ctxFiles = files.filter(f => f.type==="file" && touch.has(f.path.replace(/^\//,"")));
+  const ctx = ctxFiles.map(f => `--- FILE: ${f.path} ---\n${f.content}`).join("\n\n") || "(no existing files — fresh build)";
+  let user = `USER REQUEST:\n${userPrompt}\n\nAPPROVED PLAN:\n${JSON.stringify(planObj, null, 2)}\n\nFULL CONTENT OF FILES TO TOUCH:\n${ctx}\n\nReturn ONLY {"changes":[...]} JSON.`;
+  if (elementCtx) user += `\n\n🎯 USER SELECTED THIS ELEMENT IN THE PREVIEW — target your edit at it:\n${elementCtx.outerHTML}\n(selector hint: ${elementCtx.selector})`;
+  return [{ role:"system", content: getSpCoder() }, { role:"user", content: user }];
+}
+
+async function runCoder(provider, userPrompt, planObj, files, elementCtx, signal, onDelta) {
+  const msgs = buildCoderMessages(userPrompt, planObj, files, elementCtx);
+  const { text, usage } = await chatCompletion(provider, msgs, { signal, onDelta });
+  const parsed = extractChanges(text);
+  if (!parsed) throw new Error("CODER_INVALID_JSON::" + (text||"(empty)").slice(0,200));
+  if (parsed.error) throw new Error("CODER_REFUSED::" + parsed.error);
+  return { changes: parsed.changes, usage, raw: text };
+}
+
+/* Full pipeline for one turn. mode: "build" (new project) | "chat" (iterate current project) */
+async function runPipeline(mode, userPrompt, opts = {}) {
+  const coderP   = getProviders().find(x => x.id === (opts.coderId   || chosenProvider("coder")));
+  const plannerP = getProviders().find(x => x.id === (opts.plannerId || chosenProvider("planner"))) || coderP;
+  if (!coderP) { toast("Configure a provider in ⚙️ Providers first (and Test Connection).", "err"); return { error:"no provider" }; }
+  const setStatus = opts.setStatus || (t => { $("#genStatus").textContent = t; });
+  const setProg   = opts.setProg   || (on => { $("#genProgress").style.display = on ? "block" : "none"; });
+  const btn = opts.btn, stopBtn = opts.stopBtn;
+  if (btn) btn.disabled = true; setProg(true); if (stopBtn) stopBtn.style.display = "";
   genAbort = new AbortController();
+  const signal = genAbort.signal;
   const t0 = performance.now();
   try {
-    const messages = [
-      { role:"system", content: MASTER_SYSTEM_PROMPT },
-      { role:"user", content: promptText + "\n\nReturn ONLY the JSON array of files, nothing else." },
-    ];
-    const req = buildChatRequest(p, messages);
-    const r = await fetch(req.url, { method:"POST", headers:req.headers, body:JSON.stringify(req.body), signal:genAbort.signal });
-    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
-    const j = await r.json();
-    const text = req.extract(j);
-    const usage = req.usage(j);
-    const inTok = usage.in || Math.ceil((MASTER_SYSTEM_PROMPT.length + promptText.length)/4);
-    const outTok = usage.out || Math.ceil((text||"").length/4);
-    bumpUsage(p.id, inTok + outTok, true);
-    const files = extractJsonFiles(text);
-    if (!files || !files.length) throw new Error("Model did not return a valid JSON file array.\nRaw snippet: " + (text||"(empty)").slice(0,160));
-    const lat = Math.round(performance.now() - t0);
-    const title = promptText.split(/\s+/).slice(0,5).join(" ");
-    const proj = { id:uid(), title, createdAt:Date.now(), updatedAt:Date.now(), files:[] };
-    for (const gf of files) {
-      const path = normalizePath(gf.path);
-      const name = path.split("/").pop();
-      const parts = path.split("/").filter(Boolean);
-      for (let i = 1; i < parts.length; i++) {
-        const fp = "/" + parts.slice(0,i).join("/");
-        if (!proj.files.some(f => f.path === fp))
-          proj.files.push({ id:uid(), path:fp, name:parts[i-1], content:"", type:"folder" });
-      }
-      proj.files.push({ id:uid(), path, name, content:gf.content, type:"file" });
-      await DB.addLog({ id:uid(), time:Date.now(), provider:p.name, file:path,
-        tokensIn: Math.max(1, Math.round(inTok/files.length)), tokensOut: Math.max(1, Math.round(outTok/files.length)),
-        latencyMs: Math.round(lat/files.length) });
+    setStatus(`Pass 1/3 · Planning (${plannerP.name}/${plannerP.model})…`);
+    const baseFiles = mode === "build" ? [] : currentProject.files;
+    const { plan: planObj, usage: pu } = await runPlanner(plannerP, userPrompt, baseFiles, signal);
+    bumpUsage(plannerP.id, (pu.in||0)+(pu.out||0), true);
+    planObj.intent = mode === "build" ? "build" : "edit";
+    await opts.onPlan?.(planObj);
+
+    if (!opts.autoApprove) {                 // hand control to the UI (approve/edit chips)
+      pendingPlan = { mode, userPrompt, plan: planObj, coderId: coderP.id, plannerId: plannerP.id, elementCtx: opts.elementCtx || null };
+      setStatus(""); setProg(false); if (btn) btn.disabled = false; if (stopBtn) stopBtn.style.display = "none";
+      genAbort = null;
+      opts.onAwaitApproval?.(pendingPlan);
+      return { awaiting: true, plan: planObj };
     }
-    await DB.putProject(proj);
-    localStorage.setItem(LS_PROJECT, proj.id);
-    currentProject = proj; openFileId = null;
-    renderProjectsLists(); renderTree(); renderAnalytics(); loadLogs(); renderProviders();
-    const idx = proj.files.find(f => f.type==="file" && f.name.toLowerCase()==="index.html");
-    if (idx) openFile(idx.path); else refreshPreview();
-    st.textContent = ""; switchPage("studio");
-    toast(`🎉 Generated ${files.length} files in ${lat}ms — project “${title}”`, "ok", 5000);
+    return await executePlanStep(planObj, { ...opts, coderP, signal, setStatus, setProg, t0 });
   } catch (e) {
-    if (e.name === "AbortError") st.textContent = "Stopped.";
-    else { st.textContent = ""; bumpUsage(p.id, 0, false); toast("Generation failed: " + e.message, "err", 6000); }
+    if (e.name === "AbortError") { setStatus("⏹ Stopped."); return { aborted:true }; }
+    setStatus(""); toast("AI turn failed: " + e.message, "err", 6000);
+    bumpUsage(coderP.id, 0, false); renderProviders();
+    return { error: e.message };
   } finally {
-    btn.disabled = false; stop.style.display = "none"; pr.style.display = "none"; genAbort = null;
-    renderProviders();
+    if (!pendingPlan) { setProg(false); if (btn) btn.disabled = false; if (stopBtn) stopBtn.style.display = "none"; genAbort = null; }
   }
 }
+
+/* Passes 2+3 after approval */
+async function executePlanStep(planObj, o) {
+  const { coderP, signal, setStatus, setProg, t0 } = o;
+  const mode = o.mode || pendingPlan?.mode || "chat";
+  const userPrompt = o.userPrompt || pendingPlan?.userPrompt;
+  const elementCtx = o.elementCtx ?? pendingPlan?.elementCtx;
+  const msgId = o.msgId || null;
+  setStatus(`Pass 2/3 · Coding (${coderP.name}/${coderP.model}) — streaming…`);
+  const filesNow = mode === "build" ? [] : currentProject.files;
+  let res, errs = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      res = await runCoder(coderP, userPrompt, planObj, filesNow, elementCtx, signal, o.onDelta);
+      errs = validateChanges(res.changes, filesNow);
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      errs = [e.message];
+    }
+    if (!errs.length) break;
+    if (attempt === 0) {                     // one automatic retry with errors appended
+      setStatus(`Pass 2/3 · Validation failed (${String(errs[0]).slice(0,80)}) — retrying once…`);
+      const retryMsgs = buildCoderMessages(userPrompt, planObj, filesNow, elementCtx);
+      retryMsgs.push({ role:"assistant", content: res?.raw || "{}" },
+                     { role:"user", content: "Your previous output failed validation:\n- " + errs.join("\n- ") + "\nReturn corrected ONLY valid JSON." });
+      try {
+        const r2 = await chatCompletion(coderP, retryMsgs, { signal });
+        const p2 = extractChanges(r2.text);
+        if (p2 && !p2.error) {
+          const e2 = validateChanges(p2.changes, filesNow);
+          if (!e2.length) { res = { changes:p2.changes, usage:r2.usage, raw:r2.text }; errs = []; break; }
+          errs = e2;
+        }
+      } catch (e) { if (e.name === "AbortError") throw e; errs = [e.message]; }
+    }
+  }
+  if (errs.length) throw new Error("Validation failed after retry: " + errs.slice(0,3).join(" · "));
+
+  bumpUsage(coderP.id, (res.usage.in||0)+(res.usage.out||0), true);
+  const lat = Math.round(performance.now() - (t0 || performance.now()));
+  setStatus(`Pass 3/3 · Applying ${res.changes.length} change(s)… ✓ ${lat}ms`);
+
+  let proj;
+  if (mode === "build") {
+    const title = userPrompt.split(/\s+/).slice(0,5).join(" ");
+    proj = { id:uid(), title, createdAt:Date.now(), updatedAt:Date.now(), currentCheckpointId:null, files:[] };
+  } else proj = currentProject;
+
+  for (const c of res.changes) {
+    await DB.addLog({ id:uid(), time:Date.now(), provider:coderP.name, file:c.path,
+      tokensIn:(res.usage.in||0), tokensOut:(res.usage.out||0), latencyMs:lat, op:c.op });
+  }
+  const applied = await applyChanges(proj, res.changes, planObj.summary || userPrompt.slice(0,40), msgId);
+  if (mode === "build") { localStorage.setItem(LS_PROJECT, proj.id); switchPage("studio"); }
+  renderProviders(); loadLogs(); renderAnalytics();
+  setStatus("");
+  return { ok:true, changes: res.changes, checkpoint: applied.after, latencyMs: lat, usage: res.usage };
+}
+
+/* --- provider routing helpers --- */
+function chosenProvider(role) {
+  const r = getRouting();
+  const ps = getProviders();
+  const selId = $(role === "planner" ? "#plannerProvider" : "#genProvider")?.value;
+  return (selId && ps.some(p => p.id === selId) ? selId
+    : (r[role] && ps.some(p => p.id === r[role]) ? r[role] : ps[0]?.id)) || "";
+}
+
+/* ============================================================== CHAT ==== */
+let chatBusy = false;
+async function sendChatTurn(promptText, kind = "edit", elementCtx = null) {
+  if (chatBusy) return toast("An AI turn is already running — Stop it first.", "warn");
+  if (!currentProject) return toast("Open or create a project first.", "err");
+  const pid = currentProject.id;
+  chatBusy = true;
+  const userMsg = { id:uid(), projectId:pid, role:"user", kind, content:promptText,
+    providerId:chosenProvider("coder"), tokensIn:0, tokensOut:0, createdAt:Date.now() };
+  await DB.putMsg(userMsg); renderChat(userMsg.id);
+  $("#chatInput").value = "";
+  const progOn = on => { $("#chatProgress").style.display = on ? "block" : "none"; };
+  const status = t => { $("#chatStatus").textContent = t; };
+  progOn(true);
+  try {
+    const out = await runPipeline("chat", promptText, {
+      autoApprove: $("#autoApproveChk").checked,
+      elementCtx, setStatus:status, setProg:progOn,
+      btn: $("#chatSendBtn"), stopBtn: $("#chatStopBtn"),
+      onPlan: async pl => {
+        const m = { id:uid(), projectId:pid, role:"assistant", kind:"plan", content:pl.summary || "Plan",
+          plan:pl, providerId:chosenProvider("planner"), tokensIn:0, tokensOut:0, createdAt:Date.now() };
+        await DB.putMsg(m); renderChat(m.id);
+      },
+      onAwaitApproval: () => { status("Review the plan above → click 🛠 Build it."); },
+    });
+    if (out?.awaiting) return;               // user will press Build on the plan chip row
+    if (out?.ok) {
+      const m = { id:uid(), projectId:pid, role:"assistant", kind:"edit",
+        content:`✅ ${out.changes.length} file change(s) applied · ${out.latencyMs}ms · checkpoint saved`,
+        changes:out.changes, checkpointId:out.checkpoint.id,
+        providerId:chosenProvider("coder"), tokensIn:out.usage.in||0, tokensOut:out.usage.out||0, createdAt:Date.now() };
+      await DB.putMsg(m); renderChat(m.id); renderTimeline();
+      toast(`✔ Applied ${out.changes.length} change(s) — undoable via 🕘 History`, "ok", 4200);
+    } else if (out?.error) {
+      const m = { id:uid(), projectId:pid, role:"assistant", kind:"error", content:"❌ " + out.error,
+        providerId:chosenProvider("coder"), tokensIn:0, tokensOut:0, createdAt:Date.now() };
+      await DB.putMsg(m); renderChat(m.id);
+    }
+  } finally { chatBusy = false; progOn(false); status("");
+    $("#chatSendBtn").disabled = false; $("#chatStopBtn").style.display = "none"; }
+}
+
+/* approve a pending plan from the chat UI */
+async function approvePendingPlan(editedPlan) {
+  if (!pendingPlan) return toast("No pending plan to build.", "warn");
+  const pp = pendingPlan; pendingPlan = null;
+  const planObj = editedPlan || pp.plan;
+  chatBusy = true;
+  const progOn = on => { $("#chatProgress").style.display = on ? "block" : "none"; };
+  const status = t => { $("#chatStatus").textContent = t; };
+  progOn(true); $("#chatSendBtn").disabled = true; $("#chatStopBtn").style.display = "";
+  try {
+    genAbort = new AbortController();
+    const out = await executePlanStep(planObj, {
+      mode: pp.mode, userPrompt: pp.userPrompt, elementCtx: pp.elementCtx,
+      coderP: getProviders().find(x => x.id === pp.coderId),
+      signal: genAbort.signal, setStatus:status, setProg:progOn, t0:performance.now(),
+    });
+    if (out.ok) {
+      const pid = currentProject.id;
+      const m = { id:uid(), projectId:pid, role:"assistant", kind:"edit",
+        content:`✅ ${out.changes.length} file change(s) applied · ${out.latencyMs}ms · checkpoint saved`,
+        changes:out.changes, checkpointId:out.checkpoint.id, providerId:pp.coderId,
+        tokensIn:out.usage.in||0, tokensOut:out.usage.out||0, createdAt:Date.now() };
+      await DB.putMsg(m); renderChat(m.id); renderTimeline();
+      toast(`✔ ${out.changes.length} change(s) applied`, "ok");
+    }
+    return out;
+  } catch (e) {
+    if (e.name !== "AbortError") toast("Apply failed: " + e.message, "err", 6000);
+  } finally {
+    chatBusy = false; progOn(false); status(""); genAbort = null;
+    $("#chatSendBtn").disabled = false; $("#chatStopBtn").style.display = "none";
+  }
+}
+
+/* --- dashboard BUILD flow (two-pass, plan shown in studio chat) --- */
+async function startBuildFromDashboard() {
+  const promptText = $("#promptInput").value.trim();
+  if (!promptText) return toast("Describe what you want to build ✍️", "err");
+  if (!getProviders().length) return toast("Configure a provider first (⚙️ Providers → Test Connection).", "err");
+  pendingPlan = null;
+  showPanel("chat");                         // make sure the chat panel is visible to follow the pipeline
+  if (!currentProject) await newProject(promptText.split(/\s+/).slice(0,5).join(" "));
+  const pid = currentProject.id;
+  const um = { id:uid(), projectId:pid, role:"user", kind:"build", content:promptText,
+    providerId:chosenProvider("coder"), tokensIn:0, tokensOut:0, createdAt:Date.now() };
+  await DB.putMsg(um); renderChat(um.id);
+  const out = await runPipeline("build", promptText, {
+    autoApprove: false,
+    setStatus: t => { $("#chatStatus").textContent = t; $("#genStatus").textContent = t; },
+    setProg: on => { $("#chatProgress").style.display = on ? "block" : "none"; $("#genProgress").style.display = on ? "block" : "none"; },
+    btn: $("#generateBtn"), stopBtn: $("#stopGenBtn"),
+    onPlan: async pl => {
+      const m = { id:uid(), projectId:pid, role:"assistant", kind:"plan", content:pl.summary || "Plan",
+        plan:{ ...pl, intent:"build" }, providerId:chosenProvider("planner"), tokensIn:0, tokensOut:0, createdAt:Date.now() };
+      await DB.putMsg(m); renderChat(m.id);
+    },
+    onAwaitApproval: () => { $("#chatStatus").textContent = "Review the plan → click 🛠 Build it."; switchPage("studio"); },
+  });
+  if (out?.ok) {
+    const m = { id:uid(), projectId:pid, role:"assistant", kind:"build",
+      content:`✅ Initial build: ${out.changes.length} file(s) · ${out.latencyMs}ms · checkpoint saved`,
+      changes:out.changes, checkpointId:out.checkpoint.id, providerId:chosenProvider("coder"),
+      tokensIn:out.usage.in||0, tokensOut:out.usage.out||0, createdAt:Date.now() };
+    await DB.putMsg(m); renderChat(m.id); renderTimeline();
+    toast(`🎉 Built “${currentProject.title}” — iterate via 💬 Chat`, "ok", 5000);
+  }
+  return out;
+}
+
+/* --- render chat thread --- */
+async function renderChat(scrollToId) {
+  const host = $("#chatScroll");
+  if (!host) return;
+  if (!currentProject) { host.innerHTML = `<p class="muted">No project loaded.</p>`; return; }
+  const msgs = (await DB.msgsOf(currentProject.id)).sort((a,b)=>a.createdAt-b.createdAt);
+  host.innerHTML = msgs.map(m => {
+    const meta = `<div class="meta"><span>${m.role==="user"?"🧑 you":"🤖 "+esc(m.kind||"")}</span><span>${new Date(m.createdAt).toLocaleTimeString()}</span>${m.tokensIn||m.tokensOut?`<span>🔢 ${(m.tokensIn||0)+"/"+(m.tokensOut||0)}</span>`:""}</div>`;
+    let body = esc(m.content);
+    if (m.plan) {
+      body += `<div class="plan-box"><b>📋 Plan</b> <span class="muted">(${esc(m.plan.intent||"edit")})</span><br/>${esc(m.plan.summary||"")}
+        <ol>${(m.plan.plan||[]).map(s=>`<li>${esc(s)}</li>`).join("")}</ol>
+        <div class="muted" style="font-size:11px;margin-top:4px">files: ${esc((m.plan.filesToTouch||[]).join(", "))}</div></div>`;
+    }
+    if (m.changes) {
+      body += `<div class="diff-list">${m.changes.map(c=>`<div class="dif ${c.op}"><b>${c.op==="create"?"🔶":c.op==="delete"?"🗑":"✏️"} ${c.op}</b><span class="mono">${esc(c.path)}</span></div>`).join("")}</div>`;
+    }
+    const actions = (m.plan && !m.changes && m.kind === "plan")
+      ? `<div class="row plan-actions" data-msg="${m.id}" style="margin-top:8px">
+           <button class="btn sm primary" data-pact="build">🛠 Build it</button>
+           <button class="btn sm" data-pact="edit">✏️ Edit plan</button>
+           <button class="btn sm" data-pact="cancel">✖ Cancel</button></div>` : "";
+    return `<div class="msg ${m.role==="user"?"user":"ai"} ${m.kind==="error"?"err":""}" id="msg-${m.id}">${body}${actions}${meta}</div>`;
+  }).join("") || `<p class="muted">No messages yet — ask the AI to change something.</p>`;
+  setTimeout(() => { const t = (scrollToId && document.getElementById("msg-"+scrollToId)) || host.lastElementChild;
+    t?.scrollIntoView({ behavior:"smooth", block:"end" }); }, 40);
+}
+
+/* handle plan action chips */
+async function handlePlanAction(act, msgId) {
+  const msgs = await DB.msgsOf(currentProject.id);
+  const m = msgs.find(x => x.id === msgId); if (!m || !m.plan) return;
+  if (act === "cancel") {
+    pendingPlan = null;
+    const nm = { id:uid(), projectId:currentProject.id, role:"system", kind:"error",
+      content:"Plan cancelled — nothing was changed.", providerId:"", tokensIn:0, tokensOut:0, createdAt:Date.now() };
+    await DB.putMsg(nm); renderChat(nm.id); return;
+  }
+  if (act === "edit") {
+    const txt = await promptModal("Edit plan steps (one per line)", m.plan.plan.join("\n"));
+    if (txt === null) return;
+    m.plan.plan = txt.split("\n").map(s=>s.trim()).filter(Boolean);
+    await DB.putMsg(m); renderChat(msgId);
+  }
+  /* ensure pendingPlan matches this message's plan */
+  if (!pendingPlan) pendingPlan = { mode:"chat", userPrompt:m.content, plan:m.plan,
+    coderId:chosenProvider("coder"), plannerId:chosenProvider("planner"), elementCtx:pickedElement };
+  else pendingPlan.plan = m.plan;
+  await approvePendingPlan(m.plan);
+  $$(".plan-actions").forEach(e => e.remove());
+}
+
+/* ======================================================= CHECKPOINTS === */
+async function renderTimeline() {
+  const host = $("#timelineList");
+  if (!host) return;
+  if (!currentProject) { host.innerHTML = `<p class="muted">No project loaded.</p>`; return; }
+  const cs = (await DB.ckptsOf(currentProject.id)).sort((a,b)=>b.createdAt-a.createdAt);
+  host.innerHTML = cs.map(c => `
+    <div class="timeline-item ${c.id===currentProject.currentCheckpointId?"sel":""}" data-ck="${c.id}">
+      <span>📸</span>
+      <span class="lbl" title="${esc(c.label)}">${esc(c.label)}<br/><span class="muted" style="font-size:10px">${new Date(c.createdAt).toLocaleString()} · ${c.files.filter(f=>f.type==="file").length} files</span></span>
+      <button class="btn sm" data-ckact="restore">↩ Restore</button>
+    </div>`).join("") || `<p class="muted">No checkpoints yet — they are created automatically after every AI turn.</p>`;
+}
+async function restoreCheckpoint(id) {
+  const cs = await DB.ckptsOf(currentProject.id);
+  const c = cs.find(x => x.id === id);
+  if (!c || !currentProject) return;
+  if (!confirm(`Restore checkpoint “${c.label}”? A safety snapshot of the CURRENT state is taken first, so this is undoable.`)) return;
+  await createCheckpoint(currentProject, "Auto-snapshot before restore", null);
+  currentProject.files = JSON.parse(JSON.stringify(c.files));
+  currentProject.currentCheckpointId = c.id;
+  currentProject.updatedAt = Date.now();
+  await DB.putProject({ ...currentProject });
+  openFileId = null; renderTree(); refreshPreview(true); renderTimeline();
+  const idx = currentProject.files.find(f => f.type==="file" && f.name.toLowerCase()==="index.html");
+  if (idx) openFile(idx.path);
+  toast(`↩ Restored “${c.label}”`, "ok");
+}
+
+/* ============================================================ SHARE ==== */
+async function compressUtf8(s){ const d=new TextEncoder().encode(s), cs=new CompressionStream("gzip"), w=cs.writable.getWriter();
+  w.write(d); w.close(); const buf=await new Response(cs.readable).arrayBuffer();
+  let bin=""; const b=new Uint8Array(buf); for(let i=0;i<b.length;i++)bin+=String.fromCharCode(b[i]); return bin; }
+async function decompressUtf8(b64){ const bin=atob(b64), b=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);
+  const rs=new Blob([b]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new TextDecoder().decode(await new Response(rs).arrayBuffer()); }
+async function shareProjectUrl() {
+  if (!currentProject) return toast("No project loaded.", "err");
+  if (dirty) await doSaveFile(true);
+  const payload = { t: currentProject.title, f: currentProject.files.map(f => ({ p:f.path, n:f.name, ty:f.type, c:f.content })) };
+  try {
+    const gz = await compressUtf8(JSON.stringify(payload));
+    const b64 = btoa(gz).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+    const url = location.origin + location.pathname + "#share=" + b64;
+    if (url.length > 2000000) return toast("Project too large for a share URL (>~2MB). Use ZIP export instead.", "err", 5000);
+    window.__lastShareUrl = url;
+    await navigator.clipboard?.writeText(url).catch(()=>{});
+    toast(`🔗 Share URL ready (${Math.round(url.length/1024)} KB) — copied to clipboard & logged to console.`, "ok", 6000);
+    console.log("%cSHARE URL:", "font-weight:bold", url);
+  } catch (e) { toast("Share failed: " + e.message, "err"); }
+}
+async function importFromHash() {
+  const m = location.hash.match(/#share=(.+)$/s); if (!m) return false;
+  try {
+    let b64 = m[1].replace(/-/g,"+").replace(/_/g,"/");
+    while (b64.length % 4) b64 += "=";
+    const data = JSON.parse(await decompressUtf8(b64));
+    const proj = { id:uid(), title:data.t || "Shared project", createdAt:Date.now(), updatedAt:Date.now(),
+      currentCheckpointId:null,
+      files: data.f.map(f => ({ id:uid(), path:f.p, name:f.n, type:f.ty, content:f.c })) };
+    await DB.putProject(proj);
+    await loadProject(proj.id);
+    toast(`📥 Imported shared project “${proj.title}” (${proj.files.filter(f=>f.type==="file").length} files)`, "ok", 5000);
+    history.replaceState(null, "", location.pathname);
+    return true;
+  } catch (e) { toast("Could not import shared URL: " + e.message, "err", 6000); return false; }
+}
+
+/* ========================================================= TEMPLATES === */
+const APP_TEMPLATES = [
+  { e:"🚀", n:"Landing Page", d:"Hero, features, pricing, FAQ",
+    p:"A modern SaaS landing page: sticky nav, hero with gradient headline and CTA, 3 feature cards, pricing tiers (3 plans), FAQ accordion, footer. Tailwind CDN." },
+  { e:"📊", n:"Dashboard", d:"KPI cards + charts",
+    p:"An analytics dashboard mock: sidebar nav, 4 KPI stat cards, a line chart and donut chart drawn with canvas or inline SVG (no backend, seeded random data), recent activity table." },
+  { e:"📝", n:"Blog", d:"Posts, tags, reader",
+    p:"A personal blog: header nav, hero post card, grid of post cards with tags, clicking a post renders its full content client-side from a JS data array, dark-mode toggle." },
+  { e:"✅", n:"Todo App", d:"localStorage persistence",
+    p:"A polished todo app: add/complete/delete tasks, filters (all/active/done), counts, persisted to localStorage, keyboard accessible." },
+  { e:"🎹", n:"Portfolio", d:"Gallery + contact",
+    p:"A developer portfolio: hero intro, project gallery with hover overlays, skills bars, contact form (client-side validation only)." },
+  { e:"⏱", n:"Pomodoro", d:"Timer + sessions log",
+    p:"A Pomodoro focus timer: 25/5 minute cycles, circular progress ring (SVG), start/pause/reset, session counter, glassmorphism styling." },
+];
 
 /* =============================================== DASHBOARD / SUGGESTS == */
 const SUGGESTIONS_BY_DAYPART = {
@@ -696,10 +1277,14 @@ async function renderProjectsLists() {
       <button class="btn sm" data-open="${p.id}">Open ▸</button>
       <button class="btn sm danger" data-del="${p.id}">🗑</button>
     </div>`).join("") || `<p class="muted">No projects yet — generate one above or press ＋ New.</p>`;
-  const sel = $("#studioProjectSel"), cur = sel.value;
-  sel.innerHTML = projs.map(p => `<option value="${p.id}">${esc(p.title)}</option>`).join("") || `<option value="">— no projects —</option>`;
-  if (cur && projs.some(p=>p.id===cur)) sel.value = cur;
-  else if (currentProject) sel.value = currentProject.id;
+  const opts = projs.map(p => `<option value="${p.id}">${esc(p.title)}</option>`).join("") || `<option value="">— no projects —</option>`;
+  for (const sel of [$("#studioProjectSel"), $("#chatProjectSel")]) {
+    if (!sel) continue;
+    const cur = sel.value;
+    sel.innerHTML = opts;
+    if (cur && projs.some(p=>p.id===cur)) sel.value = cur;
+    else if (currentProject) sel.value = currentProject.id;
+  }
 }
 
 function renderGenProviderSelect() {
@@ -745,10 +1330,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   $$(".tab-btn").forEach(b => b.onclick = () => switchPage(b.dataset.page));
   if (location.hash) switchPage(location.hash.slice(1));
 
-  /* ---- greeting / suggestions / typewriter ---- */
+  /* ---- greeting / suggestions / typewriter / templates ---- */
   $("#greetingSub").textContent = greeting();
-  $("#masterPromptView").textContent = MASTER_SYSTEM_PROMPT;
-  renderSuggestions(); startTypewriter();
+  renderTemplates(); renderSuggestions(); startTypewriter();
   $("#suggestChips").addEventListener("click", e => {
     const c = e.target.closest(".chip"); if (!c) return;
     const s = SUGGESTIONS_BY_DAYPART[dayPart()][+c.dataset.i];
@@ -763,9 +1347,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
   $("#nextSuggestionBtn").onclick = () => { twIdx++; startTypewriter(); };
 
-  /* ---- generation ---- */
-  $("#generateBtn").onclick = generateProject;
-  $("#stopGenBtn").onclick = () => { genAbort?.abort(); };
+  /* ---- build mode / generation ---- */
+  $("#modeBuildBtn").onclick = () => setBuilderMode("build");
+  $("#modeChatBtn").onclick   = () => setBuilderMode("chat");
+  $("#generateBtn").onclick = startBuildFromDashboard;
+  $("#stopGenBtn").onclick = () => { genAbort?.abort(); pendingPlan = null; };
+  $("#chatSendBtn").onclick = () => {
+    const t = $("#chatInput").value.trim(); if (!t) return toast("Type what to change first ✍️", "err");
+    sendChatTurn(t, "edit", pickedElement); pickedElement = null; updatePickBar();
+  };
+  $("#chatStopBtn").onclick = () => { genAbort?.abort(); };
+  $("#chatInput").addEventListener("keydown", e => {
+    if ((e.ctrlKey||e.metaKey) && e.key === "Enter") { e.preventDefault(); $("#chatSendBtn").click(); } });
+  $("#chatProjectSel").onchange = e => e.target.value && loadProject(e.target.value);
+  $("#clearChatBtn").onclick = async () => {
+    if (!currentProject) return;
+    if (!confirm("Clear this project's chat thread? (files & checkpoints are kept)")) return;
+    await DB.delMsgsOf(currentProject.id); renderChat(); };
+  $("#autoApproveChk").checked = localStorage.getItem("csab.autoapprove") === "1";
+  $("#autoApproveChk").onchange = e => localStorage.setItem("csab.autoapprove", e.target.checked ? "1" : "0");
 
   /* ---- projects ---- */
   $("#newProjectBtn").onclick = async () => {
@@ -774,7 +1374,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
   $("#projectsList").addEventListener("click", async e => {
     const o = e.target.closest("[data-open]"), d = e.target.closest("[data-del]");
-    if (o) { await loadProject(o.dataset.open); switchPage("studio"); }
+    if (o) { await loadProject(o.dataset.open); switchPage("studio"); showPanel("chat"); }
     if (d) { if (confirm("Delete this project permanently?")) { await DB.delProject(d.dataset.del);
       if (currentProject?.id === d.dataset.del) { currentProject = null; openFileId = null; renderTree(); refreshPreview(); }
       renderProjectsLists(); } }
@@ -788,8 +1388,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#deleteProjectBtn").onclick = async () => {
     if (!currentProject) return toast("No project loaded.","err");
     if (confirm(`Delete project “${currentProject.title}”?`)) {
-      await DB.delProject(currentProject.id); currentProject = null; openFileId = null;
-      renderProjectsLists(); renderTree(); refreshPreview();
+      await DB.delProject(currentProject.id);
+      await DB.delMsgsOf(currentProject.id); await DB.delCkptsOf(currentProject.id);
+      currentProject = null; openFileId = null;
+      renderProjectsLists(); renderTree(); refreshPreview(); renderChat(); renderTimeline();
     }
   };
 
@@ -821,7 +1423,55 @@ document.addEventListener("DOMContentLoaded", async () => {
   applyTheme(localStorage.getItem(LS_THEME) || "glass-dark");   // sync CM theme now editor exists
   $("#saveFileBtn").onclick = () => doSaveFile(false);
   document.addEventListener("keydown", e => { if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); doSaveFile(false); } });
-  $("#refreshPreviewBtn").onclick = refreshPreview;
+  $("#refreshPreviewBtn").onclick = () => refreshPreview(true);
+
+  /* panels: chat + history */
+  $("#toggleChatBtn").onclick = () => showPanel("chat");
+  $("#toggleHistoryBtn").onclick = () => showPanel("history");
+  $("#shareBtn").onclick = shareProjectUrl;
+
+  /* viewport switcher */
+  $$(".vp-btn").forEach(b => b.onclick = () => setViewport(b.dataset.vp));
+  setViewport(localStorage.getItem("csab.viewport") || "auto");
+
+  /* element inspector */
+  $("#pickModeBtn").onclick = () => togglePickMode();
+  $("#cancelPickBtn").onclick = () => { pickedElement = null; updatePickBar(); togglePickMode(false); };
+  $("#editPickedBtn").onclick = () => {
+    if (!pickedElement) return;
+    setBuilderMode("chat");
+    const ta = $("#chatInput");
+    ta.value = "";
+    ta.placeholder = `Describe the change for <${pickedElement.tag}> (${pickedElement.selector})…`;
+    ta.focus();
+    toast("🎯 Element targeted — your next message will include its HTML.", "ok", 3500);
+  };
+
+  /* error overlay */
+  $("#dismissErrBtn").onclick = hideErrorOverlay;
+  $("#fixWithAiBtn").onclick = () => {
+    if (!lastPreviewError) return;
+    hideErrorOverlay();
+    sendChatTurn(`The preview throws this runtime error:\n"${lastPreviewError.message}"${lastPreviewError.file?` [${lastPreviewError.file}:${lastPreviewError.line||"?"}]`:""}\nFix it without breaking other features.`, "edit", null);
+  };
+
+  /* window messages from the sandboxed preview iframe */
+  window.addEventListener("message", ev => {
+    const d = ev.data || {};
+    if (d.type === "preview-error") showErrorOverlay(d);
+    else if (d.type === "element-pick") { pickedElement = d; updatePickBar(); togglePickMode(false); }
+    else if (d.type === "pick-off") { $("#pickModeBtn").classList.remove("primary"); $("#previewPane").classList.remove("pick-mode"); pickMode = false; }
+  });
+
+  /* plan action chips + checkpoint timeline (delegated) */
+  $("#chatScroll").addEventListener("click", e => {
+    const b = e.target.closest("[data-pact]"); if (!b) return;
+    handlePlanAction(b.dataset.pact, b.closest(".plan-actions").dataset.msg);
+  });
+  $("#timelineList").addEventListener("click", e => {
+    const b = e.target.closest("[data-ckact]"); if (!b) return;
+    restoreCheckpoint(b.closest("[data-ck]").dataset.ck);
+  });
   $("#runAllBtn").onclick = () => { const i = currentProject?.files.find(f=>f.type==="file"&&f.name.toLowerCase()==="index.html");
     if (i) { openFile(i.path); refreshPreview(); toast("Running index.html ▶", "ok", 1600); } else toast("No index.html found.","err"); };
   $("#exportZipBtn").onclick = exportZip;
@@ -871,11 +1521,28 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   $("#clearLogsBtn").onclick = async () => { await DB.clearLogs(); loadLogs(); renderAnalytics(); };
 
+  /* ---- editable system prompts + model routing (Settings) ---- */
+  $("#spPlanner").value = getSpPlanner();
+  $("#spCoder").value = getSpCoder();
+  $("#savePromptsBtn").onclick = () => {
+    localStorage.setItem("csab.sp.planner", $("#spPlanner").value);
+    localStorage.setItem("csab.sp.coder", $("#spCoder").value);
+    setRouting({ planner: $("#routePlanner").value, coder: $("#routeCoder").value });
+    $("#promptsSavedTag").textContent = "✓ saved locally " + new Date().toLocaleTimeString();
+    populateProviderSelects(); toast("System prompts & routing saved 💾", "ok");
+  };
+  $("#resetPromptsBtn").onclick = () => {
+    localStorage.removeItem("csab.sp.planner"); localStorage.removeItem("csab.sp.coder");
+    $("#spPlanner").value = DEFAULT_SP_PLANNER; $("#spCoder").value = DEFAULT_SP_CODER;
+    toast("Prompts reset to defaults ↺", "ok");
+  };
+
   /* ---- boot data ---- */
   renderProviders(); resetForm(); loadLogs().catch(()=>{}); renderAnalytics();
   try { await openDB(); } catch (e) { toast("IndexedDB unavailable: " + e, "err", 6000); return; }
+  if (await importFromHash()) { renderProjectsLists(); return; }   // shared URL wins over last project
   const last = localStorage.getItem(LS_PROJECT);
   const all = await DB.allProjects().catch(()=>[]);
   if (last && all.some(p=>p.id===last)) await loadProject(last);
-  renderProjectsLists();
+  renderProjectsLists(); populateProviderSelects(); renderChat(); renderTimeline();
 });

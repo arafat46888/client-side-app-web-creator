@@ -216,6 +216,40 @@ details.help pre{font-size:11px;white-space:pre-wrap;color:var(--muted);backgrou
   padding:10px;border-radius:10px;border:1px solid var(--border);max-height:180px;overflow:auto}
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:9px}
 ::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- Chat thread (Lovable-style iteration) ---------- */
+.chat-card{display:flex;flex-direction:column;min-height:420px;max-height:calc(100vh - 150px)}
+.chat-scroll{flex:1;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:4px 2px}
+.msg{max-width:92%;padding:9px 12px;border-radius:13px;font-size:13px;line-height:1.55;border:1px solid var(--border);white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:color-mix(in srgb,var(--accent) 18%,var(--surface-solid));border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.msg.ai{align-self:flex-start;background:var(--surface-solid)}
+.msg.err{align-self:flex-start;border-color:var(--err);background:color-mix(in srgb,var(--err) 10%,var(--surface-solid))}
+.msg .meta{font-size:10.5px;color:var(--muted);margin-top:6px;display:flex;gap:8px;flex-wrap:wrap}
+.plan-box{border:1px dashed var(--border-strong);border-radius:10px;padding:9px;margin-top:8px;background:color-mix(in srgb,var(--accent-2) 7%,transparent)}
+.plan-box ol{margin:6px 0 0 18px;font-size:12px}
+.diff-list{display:flex;flex-direction:column;gap:5px;margin-top:8px;font-size:12px}
+.dif{display:flex;gap:8px;align-items:center;padding:4px 8px;border-radius:8px;background:var(--surface-solid);border:1px solid var(--border)}
+.dif.create{border-left:3px solid var(--ok)} .dif.update{border-left:3px solid var(--warn)} .dif.delete{border-left:3px solid var(--err)}
+.chip.active{border-style:solid;border-color:var(--accent);color:var(--text);background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.tpl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tpl{padding:11px;border:1px solid var(--border);border-radius:12px;background:var(--surface-solid);text-align:left;transition:.2s}
+.tpl:hover{border-color:var(--accent);transform:translateY(-2px)}
+.tpl .e{font-size:20px}.tpl .n{font-weight:700;font-size:12.5px;margin-top:4px}.tpl .d{font-size:11px;color:var(--muted)}
+/* preview viewport switcher + overlays */
+.vp-btn.active{color:var(--accent-contrast);background:linear-gradient(135deg,var(--accent),var(--accent-2));border-color:transparent}
+.preview-body{flex:1;display:flex;justify-content:center;align-items:stretch;overflow:auto;background:
+  repeating-conic-gradient(color-mix(in srgb,var(--border) 40%,transparent) 0% 25%, transparent 0% 50%) 50%/18px 18px}
+.preview-frame{border:none;background:#fff;width:100%;height:100%;min-height:340px;transition:max-width .25s ease;box-shadow:0 0 0 1px var(--border)}
+.ovl{position:absolute;left:12px;right:12px;border-radius:10px;padding:9px 11px;font-size:12px;z-index:5;display:none;gap:8px;align-items:center;box-shadow:var(--shadow)}
+.ovl.show{display:flex}
+.ovl.error{background:color-mix(in srgb,var(--err) 92%,#000);color:#fff;top:12px}
+.ovl.pick{background:color-mix(in srgb,var(--accent) 92%,#000);color:#fff;bottom:12px}
+.pick-mode .preview-frame{cursor:crosshair}
+.timeline-item{display:flex;gap:8px;align-items:center;padding:7px 9px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);margin-bottom:7px;font-size:12px}
+.timeline-item.sel{outline:1px solid var(--accent)}
+.timeline-item .lbl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+details.prompt-edit summary{cursor:pointer;font-size:11.5px;color:var(--accent-2)}
+details.prompt-edit textarea{min-height:120px;font-size:11.5px;font-family:ui-monospace,monospace;margin-top:6px}
 </style>
 </head>
 <body>
@@ -242,17 +276,51 @@ details.help pre{font-size:11px;white-space:pre-wrap;color:var(--muted);backgrou
   <section id="page-dashboard" class="page active">
     <div class="dash-hero">
       <div class="card prompt-card">
-        <h3>✨ Build something with AI <span class="sub" id="greetingSub"></span></h3>
-        <textarea id="promptInput" placeholder="Describe the app or website you want to build…"></textarea>
-        <div class="gen-bar">
-          <select id="genProvider"></select>
-          <button id="generateBtn" class="btn primary">🚀 Generate Project</button>
-          <button id="stopGenBtn" class="btn danger" style="display:none">■ Stop</button>
-          <span id="genStatus" class="muted"></span>
+        <h3>✨ AI App Builder <span class="sub" id="greetingSub"></span></h3>
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn sm active" id="modeBuildBtn" data-mode="build">🏗 New build (plan → code)</button>
+          <button class="btn sm" id="modeChatBtn" data-mode="chat">💬 Iterate in chat</button>
+          <span style="flex:1"></span>
+          <span class="muted" id="activeProjTag"></span>
         </div>
-        <div class="progress" id="genProgress"><i></i></div>
+
+        <!-- BUILD MODE -->
+        <div id="buildMode">
+          <textarea id="promptInput" placeholder="Describe the app or website you want to build…"></textarea>
+          <div class="tpl-grid" id="templateGrid" style="margin-top:10px"></div>
+          <div class="gen-bar">
+            <select id="genProvider" title="Coder model (strong)"></select>
+            <select id="plannerProvider" title="Planner model (cheap)" style="max-width:230px"></select>
+            <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);text-transform:none;margin:0">
+              <input type="checkbox" id="autoApproveChk" style="width:auto" /> Auto-approve plan
+            </label>
+            <button id="generateBtn" class="btn primary">🧠 Plan my app</button>
+            <button id="stopGenBtn" class="btn danger" style="display:none">■ Stop</button>
+            <span id="genStatus" class="muted"></span>
+          </div>
+          <div class="progress" id="genProgress"><i></i></div>
+        </div>
+
+        <!-- CHAT / ITERATE MODE -->
+        <div id="chatMode" style="display:none">
+          <p class="muted" style="margin-bottom:8px">💬 Chat-driven iteration — every turn is diff-based (only touched files change) and creates an undoable checkpoint. Pick a project above or generate a new app first.</p>
+          <div class="gen-bar" style="margin:0 0 8px">
+            <select id="chatProjectSel" style="max-width:240px"></select>
+            <select id="chatCoderProvider" style="max-width:230px"></select>
+            <select id="chatPlannerProvider" style="max-width:230px"></select>
+          </div>
+          <textarea id="chatInput" placeholder="e.g. Make the hero button blue and add a dark-mode toggle…" style="min-height:70px"></textarea>
+          <div class="gen-bar">
+            <button id="chatSendBtn" class="btn primary">📨 Send to AI</button>
+            <button id="chatStopBtn" class="btn danger" style="display:none">■ Stop</button>
+            <span id="chatStatus" class="muted"></span>
+            <span style="flex:1"></span>
+            <span class="badge" id="elPickBadge" style="display:none"></span>
+          </div>
+        </div>
+
         <div class="suggest-chips" id="suggestChips"></div>
-        <p class="muted" style="margin-top:10px">💡 Tip: click any suggestion below the typing assistant to insert it into the prompt.</p>
+        <p class="muted" style="margin-top:10px">💡 Click any suggestion chip to insert it into the active prompt. The builder runs a two-pass pipeline: <b>Planner</b> proposes a JSON plan → you approve → <b>Coder</b> streams {op,path,content} diffs that merge into the project.</p>
       </div>
 
       <div class="card">
@@ -297,13 +365,15 @@ details.help pre{font-size:11px;white-space:pre-wrap;color:var(--muted);backgrou
       <select id="studioProjectSel" style="width:auto;max-width:280px"></select>
       <button class="btn sm" id="renameProjectBtn">✏️ Rename</button>
       <button class="btn sm" id="deleteProjectBtn" style="color:var(--err)">🗑 Delete</button>
+      <button class="btn sm" id="shareBtn" title="Encode the whole project into this URL fragment (no backend needed)">🔗 Share URL</button>
       <div class="spacer"></div>
+      <button class="btn sm" id="toggleChatBtn">💬 Chat</button>
+      <button class="btn sm" id="toggleHistoryBtn">🕘 History</button>
       <button class="btn sm" id="runAllBtn">▶ Run index.html</button>
-      <button class="btn sm" id="refreshPreviewBtn">⟳ Preview</button>
       <button class="btn primary sm" id="exportZipBtn">📦 Export ZIP</button>
     </div>
 
-    <div class="studio">
+    <div class="studio" id="studioGrid">
       <aside class="card explorer">
         <div class="pane-head" style="padding:4px 4px 8px;border-bottom:1px solid var(--border)">
           EXPLORER
@@ -323,9 +393,44 @@ details.help pre{font-size:11px;white-space:pre-wrap;color:var(--muted);backgrou
         <div class="editor-host" id="editorHost"></div>
       </div>
 
-      <div class="card preview-pane">
-        <div class="pane-head"><span class="dot" style="background:var(--accent-2)"></span>LIVE SANDBOX <span class="muted" style="font-weight:400">isolated iframe · srcdoc</span></div>
-        <iframe id="previewFrame" class="preview-frame" sandbox="allow-scripts allow-modals allow-forms allow-popups" title="Live preview"></iframe>
+      <!-- CHAT PANEL -->
+      <div class="card chat-card" id="chatPanel" style="display:none">
+        <div class="pane-head">💬 BUILD CHAT <span class="muted" style="font-weight:400">plan → approve → diff → checkpoint</span>
+          <span class="spacer"></span><button class="btn sm" id="clearChatBtn">Clear</button></div>
+        <div class="chat-scroll" id="chatScroll"><p class="muted">No messages yet.</p></div>
+        <div class="progress" id="chatProgress"><i></i></div>
+      </div>
+
+      <!-- CHECKPOINTS TIMELINE -->
+      <div class="card chat-card" id="historyPanel" style="display:none">
+        <div class="pane-head">🕘 CHECKPOINTS <span class="muted" style="font-weight:400">full snapshots · undoable</span></div>
+        <div class="chat-scroll" id="timelineList" style="overflow:auto"></div>
+      </div>
+
+      <div class="card preview-pane" id="previewPane" style="position:relative">
+        <div class="pane-head">
+          <span class="dot" style="background:var(--accent-2)"></span>LIVE SANDBOX
+          <span class="muted" style="font-weight:400" id="hotReloadTag">hot-reload · srcdoc</span>
+          <span class="spacer"></span>
+          <button class="btn sm vp-btn active" data-vp="auto">🖥 Auto</button>
+          <button class="btn sm vp-btn" data-vp="tablet">📱 Tablet</button>
+          <button class="btn sm vp-btn" data-vp="mobile">📲 Mobile</button>
+          <button class="btn sm" id="pickModeBtn" title="Click an element in the preview to target it with AI">🎯 Inspect</button>
+          <button class="btn sm" id="refreshPreviewBtn">⟳</button>
+        </div>
+        <div class="preview-body" id="previewBody">
+          <iframe id="previewFrame" class="preview-frame" sandbox="allow-scripts allow-modals allow-forms allow-popups" title="Live preview"></iframe>
+        </div>
+        <div class="ovl error" id="errOverlay">
+          <span>⛔</span><span id="errOverlayMsg" style="flex:1;min-width:0"></span>
+          <button class="btn sm" id="fixWithAiBtn">🤖 Fix with AI</button>
+          <button class="btn sm" id="dismissErrBtn">✕</button>
+        </div>
+        <div class="ovl pick" id="pickBar">
+          <span>🎯</span><span id="pickedElInfo" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          <button class="btn sm" id="editPickedBtn">✏️ Edit this element…</button>
+          <button class="btn sm" id="cancelPickBtn">✕</button>
+        </div>
       </div>
     </div>
   </section>
@@ -361,8 +466,25 @@ details.help pre{font-size:11px;white-space:pre-wrap;color:var(--muted);backgrou
           <div class="test-result" id="testResult" style="margin-top:12px">Save stays locked until a live HTTP 200 OK is received from this endpoint.</div>
         </form>
         <details class="help" style="margin-top:14px">
-          <summary>ℹ️ Master System Prompt used for generation</summary>
-          <pre id="masterPromptView"></pre>
+          <summary>🧠 AI Pipeline — editable system prompts (planner + coder) & model routing</summary>
+          <div class="form-grid" style="margin-top:10px">
+            <div><label>Planner provider (cheap/fast)</label><select id="routePlanner"></select></div>
+            <div><label>Coder provider (strong)</label><select id="routeCoder"></select></div>
+          </div>
+          <p class="muted" style="margin:8px 0 4px;font-size:11.5px">Pass 1 → Planner outputs {intent, summary, filesToTouch[], plan[]}. Pass 2 → Coder outputs {"changes":[{op,path,content}]} for touched files only. Pass 3 → deterministic validator (paths, refs, DOMParser sanity) with one automatic retry.</p>
+          <details class="prompt-edit" open><summary>SYSTEM_PROMPT_PLANNER</summary>
+            <textarea id="spPlanner"></textarea></details>
+          <details class="prompt-edit" style="margin-top:8px"><summary>SYSTEM_PROMPT_CODER</summary>
+            <textarea id="spCoder" style="min-height:200px"></textarea></details>
+          <div class="row" style="margin-top:10px">
+            <button type="button" class="btn sm primary" id="savePromptsBtn">💾 Save prompts & routing</button>
+            <button type="button" class="btn sm" id="resetPromptsBtn">↺ Reset to defaults</button>
+            <span class="muted" id="promptsSavedTag"></span>
+          </div>
+        </details>
+        <details class="help" style="margin-top:10px">
+          <summary>ℹ️ Static-frontends-only scope</summary>
+          <pre>This builder generates STATIC browser apps (HTML/CSS/JS via CDN). It does NOT generate server backends, auth or databases — that is by design: your keys and code never touch any server of ours. Export ZIP → deploy to any static host (GitHub Pages, Netlify, Vercel static).</pre>
         </details>
       </div>
 
